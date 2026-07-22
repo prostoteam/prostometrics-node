@@ -1,0 +1,50 @@
+{
+  "name": "@prostoteam/prostometrics-node",
+  "version": "0.1.0",
+  "description": "Lightweight, non-blocking Node.js client for emitting Prostometrics metrics.",
+  "type": "module",
+  "main": "./dist-cjs/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist-cjs/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "dist-cjs",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prostoteam/prostometrics-node.git"
+  },
+  "homepage": "https://github.com/prostoteam/prostometrics-node#readme",
+  "bugs": {
+    "url": "https://github.com/prostoteam/prostometrics-node/issues"
+  },
+  "scripts": {
+    "clean": "node -e \"const fs=require('node:fs'); for (const path of ['dist', 'dist-cjs']) fs.rmSync(path, { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.json && tsc -p tsconfig.cjs.json && node scripts/write-cjs-package.cjs",
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run build && node --test dist/*.test.js",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "prostometrics",
+    "metrics",
+    "observability"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "typescript": "^5.5.3"
+  }
+}
