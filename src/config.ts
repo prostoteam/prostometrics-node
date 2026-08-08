@@ -10,6 +10,7 @@ export interface Config {
   transport?: Transport;
   logger?: Logger;
   verbose?: boolean;
+  silent?: boolean;
   headers?: Record<string, string | readonly string[]>;
   fetch?: typeof globalThis.fetch;
 }
@@ -70,7 +71,8 @@ export function applyDefaults(workload: string, config: Config = {}): ResolvedCo
   let endpoint = config.endpoint ?? "";
   let transport = config.transport;
   const apiKey = config.apiKey ?? "";
-  const logger = config.logger ?? consoleLogger;
+  const logger = config.silent ? noopLogger : (config.logger ?? consoleLogger);
+  let verbose = config.verbose ?? false;
 
   if (endpoint === "" && transport === undefined) {
     endpoint = endpointFromHost(DEFAULT_ENDPOINT_HOST);
@@ -86,6 +88,7 @@ export function applyDefaults(workload: string, config: Config = {}): ResolvedCo
       workload: trimmedWorkload,
       headers: config.headers,
       logger,
+      verbose,
       fetch: config.fetch,
     });
   }
@@ -105,7 +108,14 @@ export function applyDefaults(workload: string, config: Config = {}): ResolvedCo
     if (transport.apiKey === "") {
       throw new MissingAPIKeyError();
     }
-    transport.logger = transport.logger ?? logger;
+    if (config.silent || transport.logger === undefined) {
+      transport.logger = logger;
+    }
+    if (config.verbose === undefined) {
+      verbose = transport.verbose;
+    } else {
+      transport.verbose = verbose;
+    }
     endpoint = endpoint || transport.endpoint;
     transport = new WorkloadHTTPTransport(transport, trimmedWorkload);
   }
@@ -115,7 +125,7 @@ export function applyDefaults(workload: string, config: Config = {}): ResolvedCo
     apiKey,
     transport,
     logger,
-    verbose: config.verbose ?? false,
+    verbose,
   };
 }
 

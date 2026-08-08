@@ -35,6 +35,7 @@ export interface HTTPTransportOptions {
   workload?: string;
   headers?: Record<string, string | readonly string[]>;
   logger?: Logger;
+  verbose?: boolean;
   fetch?: typeof globalThis.fetch;
   stopStatusCodes?: readonly number[];
   stopResponseCodes?: readonly string[];
@@ -49,6 +50,8 @@ interface SendResult {
 }
 
 const MAX_ERROR_BODY_BYTES = 4096;
+const DICTIONARY_RESYNC_WARNING_THRESHOLD = 3;
+const DICTIONARY_RESYNC_WARNING_WINDOW_MS = 5 * 60 * 1000;
 
 export class HTTPTransport implements Transport {
   endpoint: string;
@@ -56,11 +59,14 @@ export class HTTPTransport implements Transport {
   workload: string;
   headers: Record<string, string | readonly string[]>;
   logger?: Logger;
+  verbose: boolean;
   stopStatusCodes: readonly number[];
   stopResponseCodes: readonly string[];
 
   private readonly fetchImpl: typeof globalThis.fetch;
   private dict?: DictionaryState;
+  private dictionaryResyncWindowStart = 0;
+  private dictionaryResyncCount = 0;
 
   constructor(options: HTTPTransportOptions) {
     this.endpoint = options.endpoint;
@@ -68,6 +74,7 @@ export class HTTPTransport implements Transport {
     this.workload = options.workload ?? "";
     this.headers = options.headers ?? {};
     this.logger = options.logger;
+    this.verbose = options.verbose ?? false;
     this.fetchImpl = options.fetch ?? globalThis.fetch;
     this.stopStatusCodes = options.stopStatusCodes ?? [DEFAULT_STOP_STATUS_CODE];
     this.stopResponseCodes = options.stopResponseCodes ?? DEFAULT_STOP_RESPONSE_CODES;
@@ -104,11 +111,11 @@ export class HTTPTransport implements Transport {
         throw err;
       }
       if (err instanceof HTTPTransportError && err.statusCode === 409 && err.responseCode === "unknown_series_dictionary") {
-        log(this.logger, "prostometrics: ingester dictionary miss, resetting local dictionary and retrying");
         this.dict = newDictionaryState();
         const resyncBody = encodeLinePayloadV5(payload, this.dict, false);
         try {
           await this.sendBody(resyncBody, payload.batchID ?? "", workload, options.signal);
+          this.logDictionaryResync(err);
           return;
         } catch (retryErr) {
           if (retryErr instanceof HTTPTransportError && retryErr.statusCode === 413) {
@@ -118,6 +125,28 @@ export class HTTPTransport implements Transport {
         }
       }
       throw err;
+    }
+  }
+
+  // Routine resync is verbose-only; repeated resyncs warn about likely cache churn.
+  private logDictionaryResync(cause: HTTPTransportError): void {
+    const now = Date.now();
+    if (this.dictionaryResyncWindowStart === 0 || now - this.dictionaryResyncWindowStart > DICTIONARY_RESYNC_WARNING_WINDOW_MS) {
+      this.dictionaryResyncWindowStart = now;
+      this.dictionaryResyncCount = 0;
+    }
+    this.dictionaryResyncCount += 1;
+    if (this.verbose) {
+      log(this.logger, "prostometrics: ingester dictionary miss recovered by resync; %s", String(cause));
+      return;
+    }
+    if (this.dictionaryResyncCount === DICTIONARY_RESYNC_WARNING_THRESHOLD) {
+      log(
+        this.logger,
+        "prostometrics: repeated ingester dictionary resyncs count=%s windowMs=%s; check ingester cache churn or load balancing",
+        this.dictionaryResyncCount,
+        DICTIONARY_RESYNC_WARNING_WINDOW_MS,
+      );
     }
   }
 

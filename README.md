@@ -51,7 +51,12 @@ type Config = {
   apiKey?: string;
   logger?: { printf?: (format: string, ...args: unknown[]) => void };
   verbose?: boolean;
+  silent?: boolean;
 };
 ```
+
+Warnings that indicate metric loss or disabled ingestion are written to stderr
+by default. Routine recovery, retry, version, and flush diagnostics are logged
+only when `verbose` is enabled. Set `silent` to disable all SDK logs.
 
 Use `valueSparse` for values whose last observation should carry across missing time buckets.

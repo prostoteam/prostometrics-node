@@ -34,6 +34,8 @@ interface RetryBatch {
   nextAttempt: number;
 }
 
+const LOCAL_DROP_LOG_INTERVAL_MS = 60_000;
+
 export class Client {
   private readonly queue = new RingBuffer<Event>(DEFAULT_QUEUE_SIZE);
   private readonly retryQueue: RetryBatch[] = [];
@@ -43,6 +45,8 @@ export class Client {
   private readonly batchSession = Date.now().toString(36);
   private batchSeq = 0;
   private droppedCount = 0;
+  private readonly localDropCounts = new Map<string, number>();
+  private readonly localDropLogAt = new Map<string, number>();
   private closed = false;
   private closing = false;
   private stopSending = false;
@@ -74,6 +78,7 @@ export class Client {
   countUnique(uniqueID: unknown, metric: string, ...labels: string[]): void {
     const encodedID = canonicalUniqueID(uniqueID);
     if (!encodedID) {
+      this.logLocalDrop("invalid_unique_id", metric);
       return;
     }
     this.enqueue("unique", metric, 0, labels, encodedID);
@@ -143,7 +148,11 @@ export class Client {
     if (metric === "" || this.closed || this.closing || this.stopSending) {
       return false;
     }
-    return this.valueRateLimiter.allow();
+    if (!this.valueRateLimiter.allow()) {
+      this.logLocalDrop("value_rate_limit", metric);
+      return false;
+    }
+    return true;
   }
 
   private enqueue(type: Event["type"], metric: string, value: number, labels: readonly string[], uniqueID?: string): void {
@@ -153,7 +162,7 @@ export class Client {
       }
       const normalizedLabels = normalizeLabels(labels);
       if (hasWorkloadLabel(normalizedLabels)) {
-        log(this.config.logger, "prostometrics: workload label is reserved; drop metric %s", metric);
+        this.logLocalDrop("reserved_workload_label", metric);
         return;
       }
       const event: Event = {
@@ -166,6 +175,7 @@ export class Client {
       };
       if (!this.queue.push(event)) {
         this.droppedCount += 1;
+        this.logLocalDrop("queue_full", metric, this.droppedCount);
         return;
       }
       if (this.queue.length >= DEFAULT_MAX_BATCH_SIZE) {
@@ -173,7 +183,21 @@ export class Client {
       }
     } catch {
       // Metric calls must never throw into the application.
+      this.logLocalDrop("invalid_event", metric);
     }
+  }
+
+  // Emit one warning per drop reason per minute to preserve signal without spam.
+  private logLocalDrop(reason: string, metric: string, total?: number): void {
+    const count = total ?? (this.localDropCounts.get(reason) ?? 0) + 1;
+    this.localDropCounts.set(reason, count);
+    const now = Date.now();
+    const last = this.localDropLogAt.get(reason) ?? 0;
+    if (last !== 0 && now - last < LOCAL_DROP_LOG_INTERVAL_MS) {
+      return;
+    }
+    this.localDropLogAt.set(reason, now);
+    log(this.config.logger, "prostometrics: local metric drop reason=%s metric=%s total=%s", reason, String(metric).trim(), count);
   }
 
   private scheduleFlush(): void {
@@ -298,6 +322,8 @@ export class Client {
         if (this.enqueueRetry(payload, attempt, err)) {
           return;
         }
+        // enqueueRetry reports terminal retry loss with the specific cause.
+        return;
       }
       log(this.config.logger, "prostometrics: flush failed: %s; %s", String(err), this.flushFailureDetails(payload));
     }

@@ -1,6 +1,6 @@
 {
   "name": "@prostoteam/prostometrics-node",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lightweight, non-blocking Node.js client for emitting Prostometrics metrics.",
   "type": "module",
   "main": "./dist-cjs/index.js",
