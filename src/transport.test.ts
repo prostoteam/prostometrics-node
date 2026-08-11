@@ -111,6 +111,20 @@ test("HTTPTransport caps error body diagnostics", async () => {
   }
 });
 
+test("HTTPTransport exposes Retry-After to the client backoff", async () => {
+  const transport = new HTTPTransport({
+    endpoint: "https://collector.example.com/api/i/batch",
+    apiKey: "123_secret-token",
+    workload: "api-a",
+    fetch: async () => new Response("unavailable", { status: 503, headers: { "Retry-After": "60" } }),
+  });
+
+  await assert.rejects(
+    () => transport.send(payload),
+    (err) => err instanceof HTTPTransportError && err.retryAfterMs === 60_000,
+  );
+});
+
 function listen(server: ReturnType<typeof createServer>): Promise<void> {
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", resolve);

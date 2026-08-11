@@ -59,4 +59,8 @@ Warnings that indicate metric loss or disabled ingestion are written to stderr
 by default. Routine recovery, retry, version, and flush diagnostics are logged
 only when `verbose` is enabled. Set `silent` to disable all SDK logs.
 
+During temporary outages, the client buffers up to 30 minutes of metrics in
+memory and replays them gradually with their original timestamps. The buffer is
+bounded and is lost when the process exits.
+
 Use `valueSparse` for values whose last observation should carry across missing time buckets.

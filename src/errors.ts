@@ -65,6 +65,7 @@ export interface HTTPTransportErrorOptions {
   accepted?: number;
   dropped?: number;
   rejected?: number;
+  retryAfterMs?: number;
   requestBytes?: number;
   dictionarySession?: string;
   dictionaryRevision?: number;
@@ -84,6 +85,7 @@ export class HTTPTransportError extends ProstometricsError {
   readonly accepted: number;
   readonly dropped: number;
   readonly rejected: number;
+  readonly retryAfterMs: number;
   readonly requestBytes: number;
   readonly dictionarySession: string;
   readonly dictionaryRevision: number;
@@ -110,6 +112,7 @@ export class HTTPTransportError extends ProstometricsError {
     this.accepted = options.accepted ?? -1;
     this.dropped = options.dropped ?? -1;
     this.rejected = options.rejected ?? -1;
+    this.retryAfterMs = options.retryAfterMs ?? 0;
     this.requestBytes = requestBytes;
     this.dictionarySession = options.dictionarySession ?? "";
     this.dictionaryRevision = options.dictionaryRevision ?? 0;

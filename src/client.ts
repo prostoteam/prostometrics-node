@@ -4,11 +4,15 @@ import {
   DEFAULT_FLUSH_INTERVAL_MS,
   DEFAULT_MAX_BATCH_SIZE,
   DEFAULT_MAX_TOTAL_SERIES,
+  DEFAULT_OUTAGE_BUFFER_MAX_AGE_MS,
+  DEFAULT_OUTAGE_BUFFER_MAX_BYTES,
+  DEFAULT_OUTAGE_BUFFER_MAX_EVENTS,
+  DEFAULT_RECOVERY_JITTER_WINDOW_MS,
   DEFAULT_QUEUE_SIZE,
+  DEFAULT_REPLAY_INTERVAL_MS,
   DEFAULT_RETRY_BASE_DELAY_MS,
   DEFAULT_RETRY_FLUSH_MAX_SENDS,
   DEFAULT_RETRY_JITTER_WINDOW_MS,
-  DEFAULT_RETRY_MAX_ATTEMPTS,
   DEFAULT_RETRY_MAX_DELAY_MS,
   DEFAULT_RETRY_QUEUE_SIZE,
 } from "./constants.js";
@@ -32,6 +36,19 @@ interface RetryBatch {
   payload: Payload;
   attempts: number;
   nextAttempt: number;
+  bufferedAt: number;
+  eventCount: number;
+  estimatedBytes: number;
+}
+
+export interface ClientStats {
+  queueDropped: number;
+  retryDropped: number;
+  queueDepth: number;
+  bufferedEvents: number;
+  bufferedBytes: number;
+  bufferedBatches: number;
+  ingestDisabled: boolean;
 }
 
 const LOCAL_DROP_LOG_INTERVAL_MS = 60_000;
@@ -45,15 +62,20 @@ export class Client {
   private readonly batchSession = Date.now().toString(36);
   private batchSeq = 0;
   private droppedCount = 0;
+  private retryDroppedCount = 0;
+  private sendFailureCount = 0;
   private readonly localDropCounts = new Map<string, number>();
   private readonly localDropLogAt = new Map<string, number>();
   private closed = false;
   private closing = false;
   private stopSending = false;
-  private flushing = false;
   private flushAgain = false;
+  private activeFlush: Promise<void> | undefined;
+  private closePromise: Promise<void> | undefined;
   private transientBackoffAttempt = 0;
   private nextSendAttempt = 0;
+  private nextReplayAttempt = 0;
+  private recoveryConfirmed = false;
   private readonly timer: NodeJS.Timeout;
 
   constructor(private readonly workload: string, private readonly rawConfig: Config = {}) {
@@ -126,17 +148,49 @@ export class Client {
     return this.dropped();
   }
 
-  async close(options: CloseOptions = {}): Promise<void> {
-    if (this.closed || this.closing) {
-      return;
+  stats(): ClientStats {
+    const usage = retryQueueUsage(this.retryQueue);
+    return {
+      queueDropped: this.droppedCount,
+      retryDropped: this.retryDroppedCount,
+      queueDepth: this.queue.length,
+      bufferedEvents: usage.events,
+      bufferedBytes: usage.bytes,
+      bufferedBatches: this.retryQueue.length,
+      ingestDisabled: this.stopSending,
+    };
+  }
+
+  Stats(): ClientStats {
+    return this.stats();
+  }
+
+  close(options: CloseOptions = {}): Promise<void> {
+    if (this.closePromise) {
+      return this.closePromise;
     }
+    this.closePromise = this.performClose(options);
+    return this.closePromise;
+  }
+
+  private async performClose(options: CloseOptions): Promise<void> {
+    const failureBaseline = this.sendFailureCount;
     this.closing = true;
     clearInterval(this.timer);
-    while (this.queue.length > 0 && !options.signal?.aborted) {
-      await this.flushOneBatch(true, options.signal);
+    try {
+      if (this.activeFlush) {
+        await this.activeFlush;
+      }
+      if (this.sendFailureCount > failureBaseline) {
+        return;
+      }
+      while (this.queue.length > 0 && !options.signal?.aborted) {
+        await this.flushOneBatch(true, options.signal);
+      }
+      await this.drainRetryQueue(options.signal);
+    } finally {
+      this.closed = true;
     }
-    await this.flushRetryQueue(true, options.signal);
-    this.closed = true;
   }
 
   async Close(options: CloseOptions = {}): Promise<void> {
@@ -201,25 +255,36 @@ export class Client {
   }
 
   private scheduleFlush(): void {
+    if (this.closing || this.closed) {
+      return;
+    }
     const immediate = setImmediate(() => {
       void this.flushDue(false);
     });
     immediate.unref?.();
   }
 
-  private async flushDue(ignoreRetryBackoff: boolean): Promise<void> {
-    if (this.flushing) {
-      this.flushAgain = true;
-      return;
+  private flushDue(ignoreRetryBackoff: boolean): Promise<void> {
+    if (this.closing || this.closed) {
+      return Promise.resolve();
     }
-    this.flushing = true;
+    if (this.activeFlush) {
+      this.flushAgain = true;
+      return this.activeFlush;
+    }
+    const operation = this.performFlush(ignoreRetryBackoff);
+    this.activeFlush = operation;
+    return operation;
+  }
+
+  private async performFlush(ignoreRetryBackoff: boolean): Promise<void> {
     try {
       await this.flushOneBatch(false);
       await this.flushRetryQueue(ignoreRetryBackoff);
     } finally {
-      this.flushing = false;
+      this.activeFlush = undefined;
     }
-    if (this.flushAgain && !this.closed) {
+    if (this.flushAgain && !this.closing && !this.closed) {
       this.flushAgain = false;
       this.scheduleFlush();
     }
@@ -295,9 +360,9 @@ export class Client {
     return `${this.batchSession}-${this.batchSeq.toString(36)}`;
   }
 
-  private async sendPayload(payload: Payload, attempt: number, fromRetry: boolean, signal?: AbortSignal): Promise<void> {
+  private async sendPayload(payload: Payload, attempt: number, fromRetry: boolean, signal?: AbortSignal, bufferedAt = 0, ignoreClientBackoff = false): Promise<boolean> {
     if (payloadIsEmpty(payload) || this.stopSending || signal?.aborted) {
-      return;
+      return false;
     }
     if (!payload.batchID) {
       payload.batchID = this.nextBatchID();
@@ -305,41 +370,45 @@ export class Client {
     if (this.config.verbose && !fromRetry) {
       log(this.config.logger, "prostometrics: flushing %s events", payload.counters.length + payload.values.length + payload.uniques.length);
     }
-    if (this.deferForClientBackoff(payload, attempt)) {
-      return;
+    if (!ignoreClientBackoff && this.deferForClientBackoff(payload, attempt, bufferedAt)) {
+      return false;
     }
     try {
       await this.config.transport.send(payload, { signal });
       this.resetTransientBackoff();
     } catch (err) {
+      this.sendFailureCount += 1;
       if (isStopIngestError(err)) {
         this.stopSending = true;
         log(this.config.logger, "prostometrics: ingest disabled after non-retryable transport response: %s", String(err));
-        return;
+        return false;
       }
       if (this.shouldRetryTransport(err)) {
-        this.noteTransientFailure();
-        if (this.enqueueRetry(payload, attempt, err)) {
-          return;
+        this.noteTransientFailure(err);
+        if (this.enqueueRetry(payload, attempt, err, bufferedAt)) {
+          return false;
         }
         // enqueueRetry reports terminal retry loss with the specific cause.
-        return;
+        return false;
       }
       log(this.config.logger, "prostometrics: flush failed: %s; %s", String(err), this.flushFailureDetails(payload));
-    }
-  }
-
-  private deferForClientBackoff(payload: Payload, attempt: number): boolean {
-    if (this.nextSendAttempt === 0 || Date.now() >= this.nextSendAttempt) {
       return false;
     }
-    this.enqueueRetryAt(payload, Math.max(0, attempt - 1), this.nextSendAttempt, new Error("prostometrics: transient ingest backoff active"));
     return true;
   }
 
-  private noteTransientFailure(): void {
+  private deferForClientBackoff(payload: Payload, attempt: number, bufferedAt: number): boolean {
+    if (this.nextSendAttempt === 0 || Date.now() >= this.nextSendAttempt) {
+      return false;
+    }
+    this.enqueueRetryAt(payload, Math.max(0, attempt - 1), this.nextSendAttempt, new Error("prostometrics: transient ingest backoff active"), bufferedAt);
+    return true;
+  }
+
+  private noteTransientFailure(err: unknown): void {
     this.transientBackoffAttempt += 1;
-    this.nextSendAttempt = Date.now() + clientBackoffDelay(this.transientBackoffAttempt);
+    const delay = Math.max(clientBackoffDelay(this.transientBackoffAttempt), retryAfterDelay(err));
+    this.nextSendAttempt = Date.now() + delay;
   }
 
   private resetTransientBackoff(): void {
@@ -347,20 +416,48 @@ export class Client {
     this.nextSendAttempt = 0;
   }
 
-  private enqueueRetry(payload: Payload, attempt: number, err: unknown): boolean {
-    return this.enqueueRetryAt(payload, attempt, Date.now() + retryDelay(attempt), err);
+  private enqueueRetry(payload: Payload, attempt: number, err: unknown, bufferedAt = 0): boolean {
+    const delay = Math.max(retryDelay(attempt), retryAfterDelay(err));
+    return this.enqueueRetryAt(payload, attempt, Date.now() + delay, err, bufferedAt);
   }
 
-  private enqueueRetryAt(payload: Payload, attempts: number, nextAttempt: number, err: unknown): boolean {
-    if (attempts >= DEFAULT_RETRY_MAX_ATTEMPTS) {
-      log(this.config.logger, "prostometrics: retry budget exhausted for batchId=%s attempts=%s; %s", payload.batchID ?? "", attempts, String(err));
+  private enqueueRetryAt(payload: Payload, attempts: number, nextAttempt: number, err: unknown, bufferedAt = 0): boolean {
+    const now = Date.now();
+    const preserved = bufferedAt > 0;
+    const candidate: RetryBatch = {
+      payload,
+      attempts,
+      nextAttempt,
+      bufferedAt: preserved ? bufferedAt : now,
+      eventCount: payloadEventCount(payload),
+      estimatedBytes: estimatePayloadBytes(payload),
+    };
+    if (candidate.eventCount > DEFAULT_OUTAGE_BUFFER_MAX_EVENTS || candidate.estimatedBytes > DEFAULT_OUTAGE_BUFFER_MAX_BYTES) {
+      this.dropRetryBatch(candidate, "outage_buffer_batch_too_large");
       return false;
     }
-    if (this.retryQueue.length >= DEFAULT_RETRY_QUEUE_SIZE) {
-      log(this.config.logger, "prostometrics: retry queue full, dropping batchId=%s pending=%s; %s", payload.batchID ?? "", this.retryQueue.length, String(err));
-      return false;
+
+    if (!this.recoveryConfirmed) {
+      const cutoff = now - DEFAULT_OUTAGE_BUFFER_MAX_AGE_MS;
+      this.pruneExpiredRetryBatches(cutoff);
+      if (candidate.bufferedAt < cutoff) {
+        this.dropRetryBatch(candidate, "outage_buffer_expired");
+        return false;
+      }
     }
-    this.retryQueue.push({ payload, attempts, nextAttempt });
+
+    while (retryQueueWouldOverflow(this.retryQueue, candidate, DEFAULT_OUTAGE_BUFFER_MAX_EVENTS, DEFAULT_OUTAGE_BUFFER_MAX_BYTES)) {
+      if (this.retryQueue.length === 0) {
+        this.dropRetryBatch(candidate, "outage_buffer_full");
+        return false;
+      }
+      const oldest = oldestRetryBatchIndex(this.retryQueue);
+      this.dropRetryBatch(this.retryQueue.splice(oldest, 1)[0]!, "outage_buffer_full");
+    }
+    this.retryQueue.push(candidate);
+    if (this.config.verbose) {
+      log(this.config.logger, "prostometrics: queued retry for batchId=%s nextAttempt=%s delayMs=%s; %s", payload.batchID ?? "", attempts + 1, Math.max(0, nextAttempt - now), String(err));
+    }
     return true;
   }
 
@@ -369,18 +466,86 @@ export class Client {
       return;
     }
     const now = Date.now();
+    if (!this.recoveryConfirmed) {
+      this.pruneExpiredRetryBatches(now - DEFAULT_OUTAGE_BUFFER_MAX_AGE_MS);
+      if (this.retryQueue.length === 0) {
+        return;
+      }
+    }
+    if (!ignoreBackoff && this.nextReplayAttempt > now) {
+      return;
+    }
     let processed = 0;
     const processLimit = Math.min(this.retryQueue.length, DEFAULT_RETRY_FLUSH_MAX_SENDS);
-    for (let i = 0; i < this.retryQueue.length && processed < processLimit; ) {
-      const item = this.retryQueue[i]!;
-      if (!ignoreBackoff && item.nextAttempt > now) {
-        i += 1;
-        continue;
+    while (this.retryQueue.length > 0 && processed < processLimit) {
+      const i = oldestDueRetryBatchIndex(this.retryQueue, now, ignoreBackoff);
+      if (i < 0) {
+        break;
       }
+      const item = this.retryQueue[i]!;
       this.retryQueue.splice(i, 1);
-      await this.sendPayload(item.payload, item.attempts + 1, true, signal);
+      if (await this.sendPayload(item.payload, item.attempts + 1, true, signal, item.bufferedAt)) {
+        this.recoveryConfirmed = true;
+      }
       processed += 1;
     }
+    if (processed > 0 && !ignoreBackoff) {
+      this.nextReplayAttempt = Date.now() + DEFAULT_REPLAY_INTERVAL_MS;
+    }
+    if (this.retryQueue.length === 0) {
+      this.recoveryConfirmed = false;
+    }
+  }
+
+  private pruneExpiredRetryBatches(cutoff: number): void {
+    for (let i = 0; i < this.retryQueue.length; ) {
+      if (this.retryQueue[i]!.bufferedAt < cutoff) {
+        this.dropRetryBatch(this.retryQueue.splice(i, 1)[0]!, "outage_buffer_expired");
+        continue;
+      }
+      i += 1;
+    }
+  }
+
+  private async drainRetryQueue(signal?: AbortSignal): Promise<void> {
+    while (this.retryQueue.length > 0 && !this.stopSending && !signal?.aborted) {
+      const now = Date.now();
+      if (!this.recoveryConfirmed) {
+        this.pruneExpiredRetryBatches(now - DEFAULT_OUTAGE_BUFFER_MAX_AGE_MS);
+        if (this.retryQueue.length === 0) {
+          break;
+        }
+      }
+
+      const itemIndex = oldestRetryBatchIndex(this.retryQueue);
+      const item = this.retryQueue[itemIndex]!;
+      let due = Math.max(item.nextAttempt, this.nextSendAttempt, this.nextReplayAttempt);
+      if (!this.recoveryConfirmed) {
+        due = Math.min(due, item.bufferedAt + DEFAULT_OUTAGE_BUFFER_MAX_AGE_MS);
+      }
+      if (!(await waitUntil(due, signal))) {
+        return;
+      }
+      if (!this.recoveryConfirmed && Date.now() > item.bufferedAt + DEFAULT_OUTAGE_BUFFER_MAX_AGE_MS) {
+        continue;
+      }
+
+      this.retryQueue.splice(itemIndex, 1);
+      const succeeded = await this.sendPayload(item.payload, item.attempts + 1, true, signal, item.bufferedAt, true);
+      if (!succeeded) {
+        return;
+      }
+      this.recoveryConfirmed = true;
+      this.nextReplayAttempt = Date.now() + DEFAULT_REPLAY_INTERVAL_MS;
+    }
+    if (this.retryQueue.length === 0) {
+      this.recoveryConfirmed = false;
+    }
+  }
+
+  private dropRetryBatch(item: RetryBatch, reason: string): void {
+    this.retryDroppedCount += item.eventCount;
+    this.logLocalDrop(reason, "", this.retryDroppedCount);
   }
 
   private shouldRetryTransport(err: unknown): boolean {
@@ -406,6 +571,76 @@ export class Client {
   }
 }
 
+function payloadEventCount(payload: Payload): number {
+  return payload.counters.length + payload.values.length + payload.uniques.length;
+}
+
+function estimatePayloadBytes(payload: Payload): number {
+  let bytes = 128 + (payload.batchID?.length ?? 0);
+  const addLabels = (metric: string, labels: readonly string[]): void => {
+    bytes += 64 + Buffer.byteLength(metric);
+    for (const label of labels) {
+      bytes += 16 + Buffer.byteLength(label);
+    }
+  };
+  for (const event of payload.counters) {
+    addLabels(event.metric, event.labels);
+  }
+  for (const event of payload.values) {
+    addLabels(event.metric, event.labels);
+  }
+  for (const event of payload.uniques) {
+    addLabels(event.metric, event.labels);
+    bytes += Buffer.byteLength(event.uniqueID);
+  }
+  return bytes;
+}
+
+function retryQueueUsage(queue: readonly RetryBatch[]): { events: number; bytes: number } {
+  let events = 0;
+  let bytes = 0;
+  for (const item of queue) {
+    events += item.eventCount;
+    bytes += item.estimatedBytes;
+  }
+  return { events, bytes };
+}
+
+function retryQueueWouldOverflow(queue: readonly RetryBatch[], candidate: RetryBatch, maxEvents: number, maxBytes: number): boolean {
+  if (queue.length >= DEFAULT_RETRY_QUEUE_SIZE) {
+    return true;
+  }
+  const usage = retryQueueUsage(queue);
+  return usage.events + candidate.eventCount > maxEvents || usage.bytes + candidate.estimatedBytes > maxBytes;
+}
+
+function oldestRetryBatchIndex(queue: readonly RetryBatch[]): number {
+  let oldest = 0;
+  for (let i = 1; i < queue.length; i += 1) {
+    if (queue[i]!.bufferedAt < queue[oldest]!.bufferedAt) {
+      oldest = i;
+    }
+  }
+  return oldest;
+}
+
+function oldestDueRetryBatchIndex(queue: readonly RetryBatch[], now: number, ignoreBackoff: boolean): number {
+  let oldest = -1;
+  for (let i = 0; i < queue.length; i += 1) {
+    if (!ignoreBackoff && queue[i]!.nextAttempt > now) {
+      continue;
+    }
+    if (oldest < 0 || queue[i]!.bufferedAt < queue[oldest]!.bufferedAt) {
+      oldest = i;
+    }
+  }
+  return oldest;
+}
+
+function retryAfterDelay(err: unknown): number {
+  return err instanceof HTTPTransportError ? Math.max(0, err.retryAfterMs) : 0;
+}
+
 function retryDelay(attempt: number): number {
   const safeAttempt = Math.max(1, attempt);
   let delay = DEFAULT_RETRY_BASE_DELAY_MS;
@@ -421,15 +656,36 @@ function clientBackoffDelay(attempt: number): number {
   for (let step = 1; step < safeAttempt && delay < DEFAULT_CLIENT_BACKOFF_MAX_DELAY_MS; step += 1) {
     delay = Math.min(delay * 2, DEFAULT_CLIENT_BACKOFF_MAX_DELAY_MS);
   }
-  return delay + jitter(DEFAULT_CLIENT_BACKOFF_JITTER_WINDOW_MS);
+  const jitterWindow = safeAttempt === 1 ? DEFAULT_RECOVERY_JITTER_WINDOW_MS : DEFAULT_CLIENT_BACKOFF_JITTER_WINDOW_MS;
+  return Math.min(delay + jitter(jitterWindow), DEFAULT_CLIENT_BACKOFF_MAX_DELAY_MS);
 }
 
 function jitter(windowMs: number): number {
-  return windowMs <= 0 ? 0 : Date.now() % windowMs;
+  return windowMs <= 0 ? 0 : Math.floor(Math.random() * windowMs);
+}
+
+function waitUntil(due: number, signal?: AbortSignal): Promise<boolean> {
+  const delay = due - Date.now();
+  if (delay <= 0) {
+    return Promise.resolve(!signal?.aborted);
+  }
+  if (signal?.aborted) {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => finish(true), delay);
+    const onAbort = (): void => finish(false);
+    const finish = (completed: boolean): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(completed);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export function version(): string {
-  return "0.1.0";
+  return "0.2.0";
 }
 
 let defaultClient: Client | undefined;

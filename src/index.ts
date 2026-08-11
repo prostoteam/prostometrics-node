@@ -1,4 +1,5 @@
 export { Client, Default, Init, Count, CountUnique, Total, Value, ValueSparse, count, countUnique, init, total, value, valueSparse, version } from "./client.js";
+export type { ClientStats } from "./client.js";
 export { EndpointFromHost, endpointFromHost, ensureIngestPath } from "./config.js";
 export type { Config } from "./config.js";
 export { Label, label } from "./labels.js";

@@ -225,6 +225,7 @@ export class HTTPTransport implements Transport {
         accepted: result.accepted,
         dropped: result.dropped,
         rejected: result.rejected,
+        retryAfterMs: parseRetryAfterMs(response.headers.get("Retry-After")),
         requestBytes: body.length,
         dictionarySession: diagnostics.dictionarySession,
         dictionaryRevision: diagnostics.dictionaryRevision,
@@ -259,6 +260,18 @@ export class HTTPTransport implements Transport {
     }
     return this.stopResponseCodes.some((candidate) => candidate.trim().toLowerCase() === normalized);
   }
+}
+
+function parseRetryAfterMs(raw: string | null, nowMs = Date.now()): number {
+  if (raw === null || raw.trim() === "") {
+    return 0;
+  }
+  const trimmed = raw.trim();
+  if (/^\d+$/.test(trimmed)) {
+    return Number.parseInt(trimmed, 10) * 1000;
+  }
+  const when = Date.parse(trimmed);
+  return Number.isFinite(when) && when > nowMs ? when - nowMs : 0;
 }
 
 function parseIngestCountHeader(raw: string | null): number {
