@@ -489,14 +489,102 @@ function makeCounterPayload(batchID: string): Payload {
   };
 }
 
+function unauthorizedStopError(): StopIngestError {
+  return new StopIngestError("prostometrics: stop ingesting after HTTP 401", {
+    code: 401,
+    cause: new HTTPTransportError({
+      endpoint: "https://collector.example.com",
+      statusCode: 401,
+      status: "401 Unauthorized",
+      responseCode: "unauthorized",
+    }),
+  });
+}
+
+function unsupportedVersionStopError(): StopIngestError {
+  return new StopIngestError("prostometrics: stop ingesting after HTTP 400", {
+    code: 400,
+    cause: new HTTPTransportError({
+      endpoint: "https://collector.example.com",
+      statusCode: 400,
+      responseCode: "unsupported_protocol_version",
+    }),
+  });
+}
+
 test("client stops sending after stop ingest error", async () => {
-  const transport = new ScriptedTransport([new StopIngestError("unauthorized", { code: 401 }), undefined]);
+  const transport = new ScriptedTransport([unsupportedVersionStopError(), undefined]);
   const client = new Client("api", { transport, logger: { printf() {} } });
   client.value("latency_ms", 1);
   await client.close();
   client.value("latency_ms", 2);
   await client.close();
   assert.equal(transport.calls, 1);
+});
+
+test("client retries unauthorized during the startup grace", async () => {
+  const transport = new ScriptedTransport([unauthorizedStopError(), undefined]);
+  const client = new Client("api", { transport, logger: { printf() {} } });
+  const internals = client as unknown as {
+    stopSending: boolean;
+    nextSendAttempt: number;
+    retryQueue: Array<{ nextAttempt: number }>;
+    sendPayload(payload: Payload, attempt: number, fromRetry: boolean): Promise<boolean>;
+    flushRetryQueue(ignoreBackoff: boolean): Promise<void>;
+  };
+
+  await internals.sendPayload(makeCounterPayload("batch-1"), 1, false);
+
+  assert.equal(internals.stopSending, false);
+  assert.equal(internals.retryQueue.length, 1);
+  // One authentication attempt per interval, counting live batches too.
+  const until = internals.nextSendAttempt - Date.now();
+  assert.ok(until > 0 && until <= 2000, `nextSendAttempt in ${until}ms`);
+
+  internals.nextSendAttempt = 0;
+  internals.retryQueue[0]!.nextAttempt = Date.now() - 1;
+  await internals.flushRetryQueue(false);
+
+  assert.equal(internals.retryQueue.length, 0);
+  assert.equal(transport.calls, 2);
+  assert.deepEqual(transport.batchIDs, ["batch-1", "batch-1"]);
+  await client.close();
+});
+
+test("client stops on unauthorized after the startup grace", async () => {
+  const transport = new ScriptedTransport([unauthorizedStopError()]);
+  const client = new Client("api", { transport, logger: { printf() {} } });
+  const internals = client as unknown as {
+    stopSending: boolean;
+    authGraceUntil: number;
+    retryQueue: Array<unknown>;
+    sendPayload(payload: Payload, attempt: number, fromRetry: boolean): Promise<boolean>;
+  };
+  internals.authGraceUntil = Date.now() - 1;
+
+  await internals.sendPayload(makeCounterPayload("batch-1"), 1, false);
+
+  assert.equal(internals.stopSending, true);
+  assert.equal(internals.retryQueue.length, 0);
+  await client.close();
+});
+
+test("startup grace covers authentication only", async () => {
+  const transport = new ScriptedTransport([unsupportedVersionStopError()]);
+  const client = new Client("api", { transport, logger: { printf() {} } });
+  const internals = client as unknown as {
+    stopSending: boolean;
+    retryQueue: Array<unknown>;
+    sendPayload(payload: Payload, attempt: number, fromRetry: boolean): Promise<boolean>;
+  };
+
+  // Waiting cannot make a refused client release supported, so the grace must
+  // not defer it.
+  await internals.sendPayload(makeCounterPayload("batch-1"), 1, false);
+
+  assert.equal(internals.stopSending, true);
+  assert.equal(internals.retryQueue.length, 0);
+  await client.close();
 });
 
 test("client drops silently when queue is full", async () => {

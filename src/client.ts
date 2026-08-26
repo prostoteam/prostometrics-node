@@ -1,4 +1,6 @@
 import {
+  DEFAULT_AUTH_GRACE_RETRY_INTERVAL_MS,
+  DEFAULT_AUTH_GRACE_WINDOW_MS,
   DEFAULT_CLIENT_BACKOFF_JITTER_WINDOW_MS,
   DEFAULT_CLIENT_BACKOFF_MAX_DELAY_MS,
   DEFAULT_FLUSH_INTERVAL_MS,
@@ -15,9 +17,11 @@ import {
   DEFAULT_RETRY_JITTER_WINDOW_MS,
   DEFAULT_RETRY_MAX_DELAY_MS,
   DEFAULT_RETRY_QUEUE_SIZE,
+  HTTP_STATUS_UNAUTHORIZED,
+  RESPONSE_CODE_UNAUTHORIZED,
 } from "./constants.js";
 import { applyDefaults, type Config, type ResolvedConfig } from "./config.js";
-import { HTTPTransportError, isStopIngestError } from "./errors.js";
+import { HTTPTransportError, StopIngestError, isStopIngestError } from "./errors.js";
 import { BatchBuilder } from "./batch-builder.js";
 import { hasWorkloadLabel, normalizeLabels } from "./labels.js";
 import type { Event, Payload } from "./payload.js";
@@ -69,6 +73,8 @@ export class Client {
   private closed = false;
   private closing = false;
   private stopSending = false;
+  private readonly authGraceUntil = Date.now() + DEFAULT_AUTH_GRACE_WINDOW_MS;
+  private authGraceLogged = false;
   private flushAgain = false;
   private activeFlush: Promise<void> | undefined;
   private closePromise: Promise<void> | undefined;
@@ -379,8 +385,15 @@ export class Client {
     } catch (err) {
       this.sendFailureCount += 1;
       if (isStopIngestError(err)) {
+        if (this.deferForAuthGrace(payload, attempt, err, bufferedAt)) {
+          return false;
+        }
         this.stopSending = true;
-        log(this.config.logger, "prostometrics: ingest disabled after non-retryable transport response: %s", String(err));
+        if (isAuthStopError(err)) {
+          log(this.config.logger, "prostometrics: ingest disabled: the API key was not accepted; check that it is correct and active, then restart: %s", String(err));
+        } else {
+          log(this.config.logger, "prostometrics: ingest disabled after non-retryable transport response: %s", String(err));
+        }
         return false;
       }
       if (this.shouldRetryTransport(err)) {
@@ -402,6 +415,36 @@ export class Client {
       return false;
     }
     this.enqueueRetryAt(payload, Math.max(0, attempt - 1), this.nextSendAttempt, new Error("prostometrics: transient ingest backoff active"), bufferedAt);
+    return true;
+  }
+
+  /**
+   * Holds a batch the service refused with 401 instead of disabling ingest, for
+   * a short window after the client starts. Outside that window a 401 stays
+   * terminal, because by then it means the key is wrong or has been revoked
+   * rather than still propagating.
+   */
+  private deferForAuthGrace(payload: Payload, attempt: number, err: unknown, bufferedAt: number): boolean {
+    if (Date.now() >= this.authGraceUntil || !isAuthStopError(err)) {
+      return false;
+    }
+    const delay = Math.max(DEFAULT_AUTH_GRACE_RETRY_INTERVAL_MS, retryAfterDelay(err));
+    const nextAttempt = Date.now() + delay;
+    // Gating live batches on the same instant as the queued retry keeps the
+    // whole client to one authentication attempt per interval while the key
+    // settles, rather than one per flush.
+    this.nextSendAttempt = nextAttempt;
+    if (!this.authGraceLogged) {
+      this.authGraceLogged = true;
+      log(
+        this.config.logger,
+        "prostometrics: API key not accepted yet, retrying for up to %ss; a key created moments ago takes a few seconds to become usable",
+        Math.round(DEFAULT_AUTH_GRACE_WINDOW_MS / 1000),
+      );
+    }
+    // A failed enqueue reports its own cause and still must not disable ingest,
+    // so the refusal counts as handled either way.
+    this.enqueueRetryAt(payload, attempt, nextAttempt, err, bufferedAt);
     return true;
   }
 
@@ -638,7 +681,37 @@ function oldestDueRetryBatchIndex(queue: readonly RetryBatch[], now: number, ign
 }
 
 function retryAfterDelay(err: unknown): number {
-  return err instanceof HTTPTransportError ? Math.max(0, err.retryAfterMs) : 0;
+  const transportErr = httpTransportErrorOf(err);
+  return transportErr ? Math.max(0, transportErr.retryAfterMs) : 0;
+}
+
+// A stop response carries its transport error as the cause, so both shapes have
+// to be unwrapped before the response can be classified.
+function httpTransportErrorOf(err: unknown): HTTPTransportError | undefined {
+  if (err instanceof HTTPTransportError) {
+    return err;
+  }
+  if (err instanceof StopIngestError && err.cause instanceof HTTPTransportError) {
+    return err.cause;
+  }
+  return undefined;
+}
+
+/**
+ * Reports whether a non-retryable response was an authentication failure. The
+ * body code decides when it is present, so a 401 carrying some other terminal
+ * code is not mistaken for one.
+ */
+function isAuthStopError(err: unknown): boolean {
+  const transportErr = httpTransportErrorOf(err);
+  if (transportErr) {
+    const code = transportErr.responseCode.trim().toLowerCase();
+    if (code !== "") {
+      return code === RESPONSE_CODE_UNAUTHORIZED;
+    }
+    return transportErr.statusCode === HTTP_STATUS_UNAUTHORIZED;
+  }
+  return err instanceof StopIngestError && err.code === HTTP_STATUS_UNAUTHORIZED;
 }
 
 function retryDelay(attempt: number): number {

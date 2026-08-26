@@ -63,4 +63,10 @@ During temporary outages, the client buffers up to 30 minutes of metrics in
 memory and replays them gradually with their original timestamps. The buffer is
 bounded and is lost when the process exits.
 
+A rejected API key disables ingestion for the rest of the process, with one
+exception: for the first 30 seconds after the client is created, a rejection is
+retried instead. A key created moments earlier takes a few seconds to become
+usable, so a process started right after the key was pasted in keeps its first
+metrics rather than going quiet.
+
 Use `valueSparse` for values whose last observation should carry across missing time buckets.
