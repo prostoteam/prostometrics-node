@@ -11,7 +11,14 @@ import {
 import { HTTPTransportError, StopIngestError } from "./errors.js";
 import type { Payload } from "./payload.js";
 import { payloadIsEmpty } from "./payload.js";
-import { analyzeLinePayloadV5, encodeLinePayloadV5, newDictionaryState, shouldResetDictionary } from "./dictionary.js";
+import {
+  analyzeLinePayloadV5,
+  encodeLinePayloadV5,
+  newDictionaryState,
+  rollbackDictionary,
+  shouldResetDictionary,
+  snapshotDictionary,
+} from "./dictionary.js";
 import type { DictionaryState } from "./dictionary.js";
 import { validateWorkload } from "./workload.js";
 
@@ -97,13 +104,8 @@ export class HTTPTransport implements Transport {
       this.dict = newDictionaryState();
     }
 
-    const body = encodeLinePayloadV5(payload, this.dict!, false);
-    if (body.length === 0) {
-      return;
-    }
-
     try {
-      await this.sendBody(body, payload.batchID ?? "", workload, options.signal);
+      await this.encodeAndSend(payload, this.dict!, workload, false, options.signal);
       return;
     } catch (err) {
       if (err instanceof HTTPTransportError && err.statusCode === 413) {
@@ -112,9 +114,8 @@ export class HTTPTransport implements Transport {
       }
       if (err instanceof HTTPTransportError && err.statusCode === 409 && err.responseCode === "unknown_series_dictionary") {
         this.dict = newDictionaryState();
-        const resyncBody = encodeLinePayloadV5(payload, this.dict, false);
         try {
-          await this.sendBody(resyncBody, payload.batchID ?? "", workload, options.signal);
+          await this.encodeAndSend(payload, this.dict, workload, true, options.signal);
           this.logDictionaryResync(err);
           return;
         } catch (retryErr) {
@@ -124,6 +125,33 @@ export class HTTPTransport implements Transport {
           throw retryErr;
         }
       }
+      throw err;
+    }
+  }
+
+  /**
+   * Encodes one batch and sends it, keeping the dictionary honest on failure.
+   *
+   * The session may only remember a series definition once the request carrying
+   * it has been accepted, so any other outcome rolls the registration back and
+   * a retry re-sends the definitions with the events that need them.
+   */
+  private async encodeAndSend(
+    payload: Payload,
+    state: DictionaryState,
+    workload: string,
+    forceDefinitions: boolean,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const snapshot = snapshotDictionary(state);
+    const body = encodeLinePayloadV5(payload, state, forceDefinitions);
+    if (body.length === 0) {
+      return;
+    }
+    try {
+      await this.sendBody(body, payload.batchID ?? "", workload, signal);
+    } catch (err) {
+      rollbackDictionary(state, snapshot);
       throw err;
     }
   }

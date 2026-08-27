@@ -21,6 +21,34 @@ export function newDictionaryState(): DictionaryState {
   };
 }
 
+export interface DictionarySnapshot {
+  seriesCount: number;
+  revision: number;
+}
+
+/** Record the dictionary position before a batch is encoded. */
+export function snapshotDictionary(state: DictionaryState): DictionarySnapshot {
+  return { seriesCount: state.series.length, revision: state.revision };
+}
+
+/**
+ * Forget series definitions the server never received.
+ *
+ * Encoding registers each new series in the session and bumps the revision. If
+ * the request carrying those `S|` lines then fails, the server has never seen
+ * them, but the client would remember them and omit the definitions from the
+ * retry — leaving event lines pointing at series the server cannot resolve,
+ * which it rejects per event while still reporting the batch as accepted.
+ */
+export function rollbackDictionary(state: DictionaryState, snapshot: DictionarySnapshot): void {
+  for (let id = snapshot.seriesCount; id < state.series.length; id += 1) {
+    const series = state.series[id]!;
+    state.seriesMap.delete(seriesKey(series.metric, series.labels));
+  }
+  state.series.length = snapshot.seriesCount;
+  state.revision = snapshot.revision;
+}
+
 export function shouldResetDictionary(state: DictionaryState | undefined): boolean {
   return state === undefined || state.series.length >= DEFAULT_MAX_DICTIONARY_SERIES;
 }

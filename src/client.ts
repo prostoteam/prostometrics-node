@@ -18,12 +18,14 @@ import {
   DEFAULT_RETRY_MAX_DELAY_MS,
   DEFAULT_RETRY_QUEUE_SIZE,
   HTTP_STATUS_UNAUTHORIZED,
+  MAX_COUNTER_VALUE,
+  MAX_SAMPLE_VALUE,
   RESPONSE_CODE_UNAUTHORIZED,
 } from "./constants.js";
 import { applyDefaults, type Config, type ResolvedConfig } from "./config.js";
 import { HTTPTransportError, StopIngestError, isStopIngestError } from "./errors.js";
 import { BatchBuilder } from "./batch-builder.js";
-import { hasWorkloadLabel, normalizeLabels } from "./labels.js";
+import { isValidSample, normalizeLabels, normalizeMetric } from "./labels.js";
 import type { Event, Payload } from "./payload.js";
 import { payloadIsEmpty } from "./payload.js";
 import { RingBuffer } from "./ring-buffer.js";
@@ -220,14 +222,35 @@ export class Client {
       if (metric === "" || this.closed || this.closing || this.stopSending) {
         return;
       }
+      // Validating here rather than relying on the server matters because a
+      // name or label the server refuses fails the request, and that failure is
+      // not retryable — the batch and every unrelated metric in it are lost.
+      const name = normalizeMetric(metric);
+      if (name === undefined) {
+        this.logLocalDrop("invalid_metric", metric);
+        return;
+      }
+      // A cumulative total legitimately outgrows the counter ceiling; only the
+      // delta it produces has to fit, and applyTotal checks that.
+      if (type !== "unique" && type !== "total") {
+        const limit = type === "value" || type === "value_sparse" ? MAX_SAMPLE_VALUE : MAX_COUNTER_VALUE;
+        if (!isValidSample(value, limit)) {
+          this.logLocalDrop("invalid_value", name);
+          return;
+        }
+      }
+      if (type === "total" && !(typeof value === "number" && Number.isFinite(value) && value >= 0)) {
+        this.logLocalDrop("invalid_value", name);
+        return;
+      }
       const normalizedLabels = normalizeLabels(labels);
-      if (hasWorkloadLabel(normalizedLabels)) {
-        this.logLocalDrop("reserved_workload_label", metric);
+      if (normalizedLabels === undefined) {
+        this.logLocalDrop("invalid_labels", name);
         return;
       }
       const event: Event = {
         type,
-        metric,
+        metric: name,
         value,
         uniqueID,
         labels: normalizedLabels,
@@ -331,6 +354,7 @@ export class Client {
     const previous = this.totals.get(key);
     if (previous === undefined) {
       if (this.totals.size >= DEFAULT_MAX_TOTAL_SERIES) {
+        this.logLocalDrop("total_series_limit", event.metric);
         return undefined;
       }
       this.totals.set(key, event.value);
@@ -343,6 +367,12 @@ export class Client {
     const delta = event.value - previous;
     this.totals.set(key, event.value);
     if (delta <= 0) {
+      return undefined;
+    }
+    // The counter ceiling applies to what goes on the wire, not to the
+    // caller's cumulative reading.
+    if (delta > MAX_COUNTER_VALUE) {
+      this.logLocalDrop("total_delta_too_large", event.metric);
       return undefined;
     }
     return { ...event, type: "counter", value: delta };
