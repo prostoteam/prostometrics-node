@@ -63,10 +63,24 @@ During temporary outages, the client buffers up to 30 minutes of metrics in
 memory and replays them gradually with their original timestamps. The buffer is
 bounded and is lost when the process exits.
 
+`apiKey` is required unless you supply your own `transport`, and `init` throws
+`MissingAPIKeyError` when it is absent. Configuration errors are raised at
+construction on purpose — a missing key is a deployment mistake worth failing
+loudly at boot, not one to discover from a silent metric later. There is no
+environment-variable fallback here; read the key yourself if you want one.
+
 A rejected API key disables ingestion for the rest of the process, with one
 exception: for the first 30 seconds after the client is created, a rejection is
 retried instead. A key created moments earlier takes a few seconds to become
 usable, so a process started right after the key was pasted in keeps its first
 metrics rather than going quiet.
+
+Two things narrow that window rather than widening it. A client key — the
+`_pk_` kind, which belongs in a browser and can never authenticate here — is
+refused immediately and named as such, because no amount of waiting will make
+it work. And a process that ends while a rejection is still unresolved says so
+during `close()`, naming the events it never delivered, so a short script
+written to check that a key works cannot exit quietly on the "retrying" line
+alone.
 
 Use `valueSparse` for values whose last observation should carry across missing time buckets.

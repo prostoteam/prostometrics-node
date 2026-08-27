@@ -22,6 +22,7 @@ import {
   MAX_SAMPLE_VALUE,
   RESPONSE_CODE_UNAUTHORIZED,
 } from "./constants.js";
+import { apiKeyLooksLikeClientKey, apiKeyRefusalHint } from "./api-key.js";
 import { applyDefaults, type Config, type ResolvedConfig } from "./config.js";
 import { HTTPTransportError, StopIngestError, isStopIngestError } from "./errors.js";
 import { BatchBuilder } from "./batch-builder.js";
@@ -33,6 +34,7 @@ import { seriesKey } from "./series.js";
 import { log } from "./transport.js";
 import { canonicalUniqueID } from "./unique-id.js";
 import { ValueRateLimiter } from "./value-rate-limiter.js";
+import { VERSION } from "./version.js";
 
 export interface CloseOptions {
   signal?: AbortSignal;
@@ -77,6 +79,8 @@ export class Client {
   private stopSending = false;
   private readonly authGraceUntil = Date.now() + DEFAULT_AUTH_GRACE_WINDOW_MS;
   private authGraceLogged = false;
+  private authRefusalPending = false;
+  private authRefusalReported = false;
   private flushAgain = false;
   private activeFlush: Promise<void> | undefined;
   private closePromise: Promise<void> | undefined;
@@ -198,7 +202,28 @@ export class Client {
       await this.drainRetryQueue(options.signal);
     } finally {
       this.closed = true;
+      this.reportPendingAuthRefusal();
     }
+  }
+
+  /**
+   * Says out loud that the key was never accepted, for a process that ends
+   * before the startup grace does. Without it a short-lived program — the
+   * five-line script someone writes to check the key works — exits on the
+   * reassuring "retrying" line, having delivered nothing, with no error.
+   */
+  private reportPendingAuthRefusal(): void {
+    if (!this.authRefusalPending || this.authRefusalReported) {
+      return;
+    }
+    this.authRefusalReported = true;
+    const stats = this.stats();
+    log(
+      this.config.logger,
+      "prostometrics: shutting down while the API key was still refused; undelivered events: %s; check that the key is correct and active%s",
+      stats.bufferedEvents + stats.queueDepth,
+      apiKeyRefusalHint(this.config.apiKey),
+    );
   }
 
   async Close(options: CloseOptions = {}): Promise<void> {
@@ -411,6 +436,9 @@ export class Client {
     }
     try {
       await this.config.transport.send(payload, { signal });
+      // A batch got through, so whatever the service refused earlier has resolved
+      // and shutdown has nothing left to warn about.
+      this.authRefusalPending = false;
       this.resetTransientBackoff();
     } catch (err) {
       this.sendFailureCount += 1;
@@ -420,7 +448,12 @@ export class Client {
         }
         this.stopSending = true;
         if (isAuthStopError(err)) {
-          log(this.config.logger, "prostometrics: ingest disabled: the API key was not accepted; check that it is correct and active, then restart: %s", String(err));
+          log(
+            this.config.logger,
+            "prostometrics: ingest disabled: the API key was not accepted; check that it is correct and active, then restart: %s%s",
+            String(err),
+            apiKeyRefusalHint(this.config.apiKey),
+          );
         } else {
           log(this.config.logger, "prostometrics: ingest disabled after non-retryable transport response: %s", String(err));
         }
@@ -458,6 +491,13 @@ export class Client {
     if (Date.now() >= this.authGraceUntil || !isAuthStopError(err)) {
       return false;
     }
+    // Waiting helps only a key that may still be propagating. A client key is
+    // refused by construction, so holding the batch would trade an immediate,
+    // accurate error for half a minute of misleading reassurance.
+    if (apiKeyLooksLikeClientKey(this.config.apiKey)) {
+      return false;
+    }
+    this.authRefusalPending = true;
     const delay = Math.max(DEFAULT_AUTH_GRACE_RETRY_INTERVAL_MS, retryAfterDelay(err));
     const nextAttempt = Date.now() + delay;
     // Gating live batches on the same instant as the queued retry keeps the
@@ -788,7 +828,7 @@ function waitUntil(due: number, signal?: AbortSignal): Promise<boolean> {
 }
 
 export function version(): string {
-  return "0.2.0";
+  return VERSION;
 }
 
 let defaultClient: Client | undefined;
