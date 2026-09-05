@@ -1,4 +1,4 @@
-export type MetricType = "counter" | "value" | "value_sparse" | "total" | "unique";
+export type MetricType = "counter" | "value" | "value_sparse" | "success" | "total" | "unique";
 
 export interface Event {
   readonly type: MetricType;
@@ -27,6 +27,10 @@ export interface ValueEvent {
   metric: string;
   value: number;
   sparse: boolean;
+  // A success outcome: the sample is 100 or 0 and the server presents the
+  // metric as a success rate. Optional so payloads built by hand (custom
+  // transports and their tests) keep type-checking; absent means false.
+  success?: boolean;
   labels: string[];
   timestamp: number;
 }

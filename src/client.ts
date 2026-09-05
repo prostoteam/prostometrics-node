@@ -61,6 +61,11 @@ export interface ClientStats {
 
 const LOCAL_DROP_LOG_INTERVAL_MS = 60_000;
 
+// What success() sends: the average of these is the success rate, already as a
+// percentage.
+const SUCCESS_SAMPLE = 100;
+const FAILURE_SAMPLE = 0;
+
 export class Client {
   private readonly queue = new RingBuffer<Event>(DEFAULT_QUEUE_SIZE);
   private readonly retryQueue: RetryBatch[] = [];
@@ -150,6 +155,22 @@ export class Client {
 
   ValueSparse(metric: string, value: number, ...labels: string[]): void {
     this.valueSparse(metric, value, ...labels);
+  }
+
+  /**
+   * Records whether an operation succeeded. The sample is 100 for success and
+   * 0 for failure, so the metric's average is the success rate and the service
+   * shows it as a percentage.
+   */
+  success(metric: string, ok: boolean, ...labels: string[]): void {
+    if (!this.allowValue(metric)) {
+      return;
+    }
+    this.enqueue("success", metric, ok ? SUCCESS_SAMPLE : FAILURE_SAMPLE, labels);
+  }
+
+  Success(metric: string, ok: boolean, ...labels: string[]): void {
+    this.success(metric, ok, ...labels);
   }
 
   dropped(): number {
@@ -258,7 +279,7 @@ export class Client {
       // A cumulative total legitimately outgrows the counter ceiling; only the
       // delta it produces has to fit, and applyTotal checks that.
       if (type !== "unique" && type !== "total") {
-        const limit = type === "value" || type === "value_sparse" ? MAX_SAMPLE_VALUE : MAX_COUNTER_VALUE;
+        const limit = type === "value" || type === "value_sparse" || type === "success" ? MAX_SAMPLE_VALUE : MAX_COUNTER_VALUE;
         if (!isValidSample(value, limit)) {
           this.logLocalDrop("invalid_value", name);
           return;
@@ -878,3 +899,9 @@ export function valueSparse(metric: string, sample: number, ...labels: string[])
 }
 
 export const ValueSparse = valueSparse;
+
+export function success(metric: string, ok: boolean, ...labels: string[]): void {
+  defaultClient?.success(metric, ok, ...labels);
+}
+
+export const Success = success;

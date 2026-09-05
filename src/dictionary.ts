@@ -59,7 +59,7 @@ export function encodeLinePayloadV5(payload: Payload | undefined, state: Diction
   }
 
   type EncodedEvent = {
-    metricType: "c" | "v" | "s" | "u";
+    metricType: "c" | "v" | "s" | "o" | "u";
     seriesID: number;
     value: number | string;
     timestamp: number;
@@ -93,7 +93,7 @@ export function encodeLinePayloadV5(payload: Payload | undefined, state: Diction
   }
   for (const value of payload!.values) {
     events.push({
-      metricType: value.sparse ? "s" : "v",
+      metricType: value.sparse ? "s" : value.success ? "o" : "v",
       seriesID: getSeriesID(value.metric, value.labels),
       value: value.value,
       timestamp: value.timestamp,

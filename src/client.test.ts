@@ -149,7 +149,7 @@ test("client retries with the original batch ID and event timestamp", async () =
   const payload: Payload = {
     batchID: "batch-1",
     counters: [],
-    values: [{ metric: "latency_ms", value: 1, sparse: false, labels: [], timestamp: 1730000000 }],
+    values: [{ metric: "latency_ms", value: 1, sparse: false, success: false, labels: [], timestamp: 1730000000 }],
     uniques: [],
   };
   const internals = client as unknown as {
@@ -617,4 +617,34 @@ test("client marks sparse values without adding a synthetic label", async () => 
 
   assert.equal(transport.batches[0]!.values[0]!.sparse, true);
   assert.deepEqual(transport.batches[0]!.values[0]!.labels, ["mount=/"]);
+});
+
+test("client sends success as a 100-or-0 value marked as an outcome", async () => {
+  const transport = new MemoryTransport();
+  const client = new Client("api", { transport, logger: { printf() {} } });
+
+  client.success("payment", true, "provider=stripe");
+  client.success("payment", false, "provider=stripe");
+  await client.close();
+
+  const values = transport.batches[0]!.values;
+  assert.deepEqual(
+    values.map((value) => [value.value, value.success, value.sparse]),
+    [
+      [100, true, false],
+      [0, true, false],
+    ],
+  );
+  assert.deepEqual(values[0]!.labels, ["provider=stripe"]);
+});
+
+test("client skips success outcomes before queueing when the limiter rejects", async () => {
+  const transport = new MemoryTransport();
+  const client = new Client("api", { transport, logger: { printf() {} } });
+  const internals = client as unknown as { valueRateLimiter: { allow(): boolean }; queue: { length: number } };
+  internals.valueRateLimiter = { allow: () => false };
+
+  client.success("payment", true);
+  assert.equal(internals.queue.length, 0);
+  await client.close();
 });

@@ -16,10 +16,12 @@ export class BatchBuilder {
         return;
       case "value":
       case "value_sparse":
+      case "success":
         this.payload.values.push({
           metric: event.metric,
           value: event.value,
           sparse: event.type === "value_sparse",
+          success: event.type === "success",
           labels: cloneLabels(event.labels),
           timestamp: event.timestamp,
         });
