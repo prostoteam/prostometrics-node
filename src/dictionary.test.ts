@@ -12,6 +12,7 @@ test("encodeLinePayloadV5 sends only new series definitions", () => {
     counters: [{ metric: "requests", value: 1, labels: [label("env", "prod")], timestamp: 1730000000 }],
     values: [],
     uniques: [],
+    tops: [],
   };
   const firstBody = encodeLinePayloadV5(first, state).toString("utf8");
   assert.match(firstBody, /^H\|5\|s\|test-session\|1\n/);
@@ -24,6 +25,7 @@ test("encodeLinePayloadV5 sends only new series definitions", () => {
     ],
     values: [],
     uniques: [],
+    tops: [],
   };
   const secondBody = encodeLinePayloadV5(second, state).toString("utf8");
   assert.equal((secondBody.match(/\nS\|/g) ?? []).length, 1);
@@ -38,6 +40,7 @@ test("encodeLinePayloadV5 uses the dedicated sparse event type", () => {
     counters: [],
     values: [{ metric: "capacity_kb", value: 1024, sparse: true, success: false, labels: ["mount=/"], timestamp: 1730000000 }],
     uniques: [],
+    tops: [],
   };
 
   const body = encodeLinePayloadV5(payload, state).toString("utf8");
@@ -55,10 +58,34 @@ test("encodeLinePayloadV5 uses the outcome event type for success", () => {
       { metric: "payment", value: 0, sparse: false, success: true, labels: ["provider=stripe"], timestamp: 1730000001 },
     ],
     uniques: [],
+    tops: [],
   };
 
   const body = encodeLinePayloadV5(payload, state).toString("utf8");
   assert.match(body, /\nS\|0\|payment\|provider=stripe\n/);
   assert.match(body, /\no\|0\|100\|1730000000\n/);
   assert.match(body, /\no\|0\|0\|1730000001\n/);
+});
+
+test("encodeLinePayloadV5 writes the top item last, verbatim", () => {
+  const state = newDictionaryState();
+  state.sessionID = "test-session";
+  const payload: Payload = {
+    counters: [],
+    values: [],
+    uniques: [],
+    tops: [
+      { metric: "top_articles", uniqueID: "42", item: "a|b|c", labels: [], timestamp: 1730000000 },
+      { metric: "top_articles", uniqueID: "43", item: " статья 7 ", labels: [], timestamp: 1730000001 },
+    ],
+  };
+
+  const body = encodeLinePayloadV5(payload, state).toString("utf8");
+  assert.deepEqual(body.split("\n"), [
+    "H|5|s|test-session|1",
+    "S|0|top_articles", // a top series definition carries only the metric name
+    "t|0|42|1730000000|a|b|c",
+    "t|0|43|1730000001| статья 7 ",
+    "",
+  ]);
 });

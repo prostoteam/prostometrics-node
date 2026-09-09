@@ -52,6 +52,7 @@ function counterPayload(batchID: string): Payload {
     counters: [{ metric: "requests", value: 1, labels: [], timestamp: 1730000000 }],
     values: [],
     uniques: [],
+    tops: [],
   };
 }
 

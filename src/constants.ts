@@ -40,6 +40,7 @@ export const WORKLOAD_MAX_LEN = 100;
 export const MAX_METRIC_BYTES = 100;
 export const MAX_LABELS_PER_SERIES = 8;
 export const MAX_LABEL_BYTES = 512;
+export const MAX_TOP_ITEM_BYTES = 256;
 export const RESERVED_LABEL_NAME = "workload";
 export const MAX_COUNTER_VALUE = 4294967295;
 export const MAX_SAMPLE_VALUE = Math.floor(4294967295 / 10);

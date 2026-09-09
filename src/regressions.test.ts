@@ -6,6 +6,7 @@ import { Client } from "./client.js";
 import { HTTPTransport } from "./transport.js";
 import { normalizeLabels, normalizeMetric } from "./labels.js";
 import type { Payload } from "./payload.js";
+import { isValidTopItem } from "./top-item.js";
 
 const listen = (server: ReturnType<typeof createServer>): Promise<void> =>
   new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
@@ -18,6 +19,7 @@ const counterPayload = (metric: string): Payload => ({
   counters: [{ metric, value: 1, labels: [], timestamp: 1730000000 }],
   values: [],
   uniques: [],
+  tops: [],
 });
 
 const seriesLines = (body: string): string[] =>
@@ -108,4 +110,16 @@ test("labels the server would refuse are rejected instead of being sent", () => 
 
   // Order is preserved: it is part of how existing series are keyed.
   assert.deepEqual(normalizeLabels(["status=200", "method=GET"]), ["status=200", "method=GET"]);
+});
+
+test("top-list items the server would refuse are rejected instead of being sent", () => {
+  for (const item of ["a", "article-1", "  padded, never trimmed  ", "pipes|are|fine", "статья 7", "x".repeat(256), "é".repeat(128)]) {
+    assert.equal(isValidTopItem(item), true, `expected ${JSON.stringify(item)} to be accepted`);
+  }
+  const nul = String.fromCharCode(0);
+  const tab = String.fromCharCode(9);
+  const del = String.fromCharCode(127);
+  for (const item of ["", `a${nul}b`, `a${tab}b`, `a${del}b`, "line\nbreak", "\ud800", "x".repeat(257), "é".repeat(129), 42, undefined]) {
+    assert.equal(isValidTopItem(item), false, `expected ${JSON.stringify(item)} to be rejected`);
+  }
 });

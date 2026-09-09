@@ -11,7 +11,7 @@ npm install @prostoteam/prostometrics-node
 ## Quick Start
 
 ```ts
-import { init, count, countUnique, total, value, valueSparse, success, label } from "@prostoteam/prostometrics-node";
+import { init, count, countUnique, countTop, total, value, valueSparse, success, label } from "@prostoteam/prostometrics-node";
 
 const client = init("payments-api", {
   apiKey: "your-prostometrics-api-key",
@@ -19,6 +19,7 @@ const client = init("payments-api", {
 
 count("requests", 1, "service=api", label("method", "GET"));
 countUnique(42n, "daily_active_users", "service=api");
+countTop(42n, "top_articles", "how-to-cancel");
 total("host.net.kb", 2048, "iface=eth0", "dir=rx");
 value("latency_ms", 123.4, "service=api", "endpoint=/login");
 valueSparse("host.fs.capacity_kb", 1024 * 1024, "mount=/");
@@ -35,6 +36,7 @@ const client = init(workload, config);
 
 client.count(metric, delta, ...labels);
 client.countUnique(uniqueID, metric, ...labels);
+client.countTop(uniqueID, metric, item);
 client.total(metric, total, ...labels);
 client.value(metric, value, ...labels);
 client.valueSparse(metric, value, ...labels);
@@ -42,9 +44,11 @@ client.success(metric, ok, ...labels);
 await client.close();
 ```
 
-Package-level helpers (`count`, `countUnique`, `total`, `value`, `valueSparse`, `success`) use the client created by `init`.
+Package-level helpers (`count`, `countUnique`, `countTop`, `total`, `value`, `valueSparse`, `success`) use the client created by `init`.
 
 `uniqueID` accepts non-negative safe integers, `bigint`, decimal strings, `Buffer`, or `Uint8Array`.
+
+`countTop` records that a person (the same `uniqueID` `countUnique` takes) touched an item — an article, a product, an endpoint — and the product ranks items by how many distinct people touched them over any date range. The item is stored exactly as sent, up to 256 bytes; `countTop` takes no labels.
 
 ## Configuration
 

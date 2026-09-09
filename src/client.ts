@@ -31,6 +31,7 @@ import type { Event, Payload } from "./payload.js";
 import { payloadIsEmpty } from "./payload.js";
 import { RingBuffer } from "./ring-buffer.js";
 import { seriesKey } from "./series.js";
+import { isValidTopItem } from "./top-item.js";
 import { log } from "./transport.js";
 import { canonicalUniqueID } from "./unique-id.js";
 import { ValueRateLimiter } from "./value-rate-limiter.js";
@@ -125,6 +126,29 @@ export class Client {
 
   CountUnique(uniqueID: unknown, metric: string, ...labels: string[]): void {
     this.countUnique(uniqueID, metric, ...labels);
+  }
+
+  /**
+   * Records that the person with uniqueID touched item, for a top list ranking
+   * items by distinct people. uniqueID is the same kind of id countUnique
+   * takes. The item is sent exactly as given — up to 256 bytes of UTF-8 with
+   * no control characters — and the series takes no labels.
+   */
+  countTop(uniqueID: unknown, metric: string, item: string): void {
+    const encodedID = canonicalUniqueID(uniqueID);
+    if (!encodedID) {
+      this.logLocalDrop("invalid_unique_id", metric);
+      return;
+    }
+    if (!isValidTopItem(item)) {
+      this.logLocalDrop("invalid_top_item", metric);
+      return;
+    }
+    this.enqueue("top", metric, 0, [], encodedID, item);
+  }
+
+  CountTop(uniqueID: unknown, metric: string, item: string): void {
+    this.countTop(uniqueID, metric, item);
   }
 
   total(metric: string, total: number, ...labels: string[]): void {
@@ -263,7 +287,7 @@ export class Client {
     return true;
   }
 
-  private enqueue(type: Event["type"], metric: string, value: number, labels: readonly string[], uniqueID?: string): void {
+  private enqueue(type: Event["type"], metric: string, value: number, labels: readonly string[], uniqueID?: string, item?: string): void {
     try {
       if (metric === "" || this.closed || this.closing || this.stopSending) {
         return;
@@ -278,7 +302,7 @@ export class Client {
       }
       // A cumulative total legitimately outgrows the counter ceiling; only the
       // delta it produces has to fit, and applyTotal checks that.
-      if (type !== "unique" && type !== "total") {
+      if (type !== "unique" && type !== "top" && type !== "total") {
         const limit = type === "value" || type === "value_sparse" || type === "success" ? MAX_SAMPLE_VALUE : MAX_COUNTER_VALUE;
         if (!isValidSample(value, limit)) {
           this.logLocalDrop("invalid_value", name);
@@ -299,6 +323,7 @@ export class Client {
         metric: name,
         value,
         uniqueID,
+        item,
         labels: normalizedLabels,
         timestamp: Math.floor(Date.now() / 1000),
       };
@@ -450,7 +475,7 @@ export class Client {
       payload.batchID = this.nextBatchID();
     }
     if (this.config.verbose && !fromRetry) {
-      log(this.config.logger, "prostometrics: flushing %s events", payload.counters.length + payload.values.length + payload.uniques.length);
+      log(this.config.logger, "prostometrics: flushing %s events", payloadEventCount(payload));
     }
     if (!ignoreClientBackoff && this.deferForClientBackoff(payload, attempt, bufferedAt)) {
       return false;
@@ -695,10 +720,11 @@ export class Client {
   private flushFailureDetails(payload: Payload): string {
     return [
       `batchId=${payload.batchID ?? ""}`,
-      `events=${payload.counters.length + payload.values.length + payload.uniques.length}`,
+      `events=${payloadEventCount(payload)}`,
       `counters=${payload.counters.length}`,
       `values=${payload.values.length}`,
       `uniques=${payload.uniques.length}`,
+      `tops=${payload.tops?.length ?? 0}`,
       `queueDepth=${this.queue.length}`,
       `dropped=${this.droppedCount}`,
     ].join(" ");
@@ -706,7 +732,7 @@ export class Client {
 }
 
 function payloadEventCount(payload: Payload): number {
-  return payload.counters.length + payload.values.length + payload.uniques.length;
+  return payload.counters.length + payload.values.length + payload.uniques.length + (payload.tops?.length ?? 0);
 }
 
 function estimatePayloadBytes(payload: Payload): number {
@@ -726,6 +752,10 @@ function estimatePayloadBytes(payload: Payload): number {
   for (const event of payload.uniques) {
     addLabels(event.metric, event.labels);
     bytes += Buffer.byteLength(event.uniqueID);
+  }
+  for (const event of payload.tops ?? []) {
+    addLabels(event.metric, event.labels);
+    bytes += Buffer.byteLength(event.uniqueID) + Buffer.byteLength(event.item);
   }
   return bytes;
 }
@@ -881,6 +911,12 @@ export function countUnique(uniqueID: unknown, metric: string, ...labels: string
 }
 
 export const CountUnique = countUnique;
+
+export function countTop(uniqueID: unknown, metric: string, item: string): void {
+  defaultClient?.countTop(uniqueID, metric, item);
+}
+
+export const CountTop = countTop;
 
 export function total(metric: string, currentTotal: number, ...labels: string[]): void {
   defaultClient?.total(metric, currentTotal, ...labels);

@@ -8,6 +8,7 @@ export class BatchBuilder {
   private readonly payload: Payload = emptyPayload();
   private readonly counterAggs = new Map<string, number>();
   private readonly uniqueSeen = new Set<string>();
+  private readonly topSeen = new Set<string>();
 
   add(event: Event): void {
     switch (event.type) {
@@ -28,6 +29,9 @@ export class BatchBuilder {
         return;
       case "unique":
         this.addUnique(event);
+        return;
+      case "top":
+        this.addTop(event);
         return;
       case "total":
         return;
@@ -74,6 +78,25 @@ export class BatchBuilder {
     this.payload.uniques.push({
       metric: event.metric,
       uniqueID: event.uniqueID,
+      labels: cloneLabels(event.labels),
+      timestamp: event.timestamp,
+    });
+  }
+
+  // One person touching the same item repeatedly within a batch is sent once.
+  private addTop(event: Event): void {
+    if (!event.uniqueID || !event.item) {
+      return;
+    }
+    const key = `${seriesKey(event.metric, event.labels)}\x01${event.uniqueID}\x01${event.item}`;
+    if (this.topSeen.has(key)) {
+      return;
+    }
+    this.topSeen.add(key);
+    (this.payload.tops ??= []).push({
+      metric: event.metric,
+      uniqueID: event.uniqueID,
+      item: event.item,
       labels: cloneLabels(event.labels),
       timestamp: event.timestamp,
     });

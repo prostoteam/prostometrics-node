@@ -66,7 +66,7 @@ test("outage buffer drop logs once", async () => {
   for (let i = 1; i <= 3; i += 1) {
     if (internals.retryQueue.length === 0) {
       internals.retryQueue.push({
-        payload: { batchID: "full", counters: [], values: [], uniques: [] },
+        payload: { batchID: "full", counters: [], values: [], uniques: [], tops: [] },
         attempts: 1,
         nextAttempt: 0,
         bufferedAt: Date.now() - 60_000,
@@ -82,6 +82,7 @@ test("outage buffer drop logs once", async () => {
         counters: [{ metric: "requests", value: 1, labels: [], timestamp: 1730000000 }],
         values: [],
         uniques: [],
+        tops: [],
       },
       1,
       new HTTPTransportError({ endpoint: "https://collector.example.com", statusCode: 503 }),

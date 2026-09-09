@@ -101,6 +101,64 @@ test("client drops unique IDs outside uint64 range", async () => {
   assert.equal(transport.batches[0]!.uniques[0]!.uniqueID, "18446744073709551615");
 });
 
+test("client records top items verbatim and deduplicates person and item within a batch", async () => {
+  const transport = new MemoryTransport();
+  const client = new Client("api", { transport, logger: { printf() {} } });
+
+  client.countTop(42, "top_articles", "article-1");
+  client.countTop("00042", "top_articles", "article-1"); // same person, same item: sent once
+  client.countTop(43n, "top_articles", "article-1");
+  client.countTop(42, "top_articles", " article|two "); // kept exactly as sent, pipe and padding included
+  client.countUnique(42, "top_articles"); // a plain unique event is not folded into the top list
+  await client.close();
+
+  assert.equal(transport.batches.length, 1);
+  const batch = transport.batches[0]!;
+  assert.deepEqual(
+    batch.tops!.map((event) => [event.uniqueID, event.item]),
+    [
+      ["42", "article-1"],
+      ["43", "article-1"],
+      ["42", " article|two "],
+    ],
+  );
+  assert.ok(batch.tops!.every((event) => event.metric === "top_articles" && event.labels.length === 0 && event.timestamp > 0));
+  assert.equal(batch.uniques.length, 1);
+});
+
+test("client drops top events with an invalid id or item before they reach the queue", async () => {
+  const transport = new MemoryTransport();
+  const lines: string[] = [];
+  const client = new Client("api", {
+    transport,
+    logger: {
+      printf(format: string, ...args: unknown[]) {
+        lines.push(format.replace(/%[sdv]/g, () => String(args.shift())));
+      },
+    },
+  });
+
+  client.countTop(-1, "top_articles", "article-1");
+  client.countTop(1.5, "top_articles", "article-1");
+  const del = String.fromCharCode(127);
+  const badItems = ["", "line\nbreak", "tab\tseparated", `del${del}char`, "\ud800lone surrogate", "x".repeat(257), "é".repeat(129)];
+  for (const item of badItems) {
+    client.countTop(1, "top_articles", item);
+  }
+  client.countTop(1, "top_articles", "x".repeat(256)); // exactly at the limit is fine
+  client.countTop(1, "top_articles", "é".repeat(128)); // 256 bytes of two-byte characters
+  await client.close();
+
+  assert.equal(transport.batches.length, 1);
+  assert.deepEqual(
+    transport.batches[0]!.tops!.map((event) => event.item),
+    ["x".repeat(256), "é".repeat(128)],
+  );
+  assert.equal(lines.filter((line) => line.includes("invalid_unique_id")).length, 1, "rate-limited to one warning");
+  assert.equal(lines.filter((line) => line.includes("invalid_top_item")).length, 1, "rate-limited to one warning");
+  assert.equal(client.stats().queueDropped, 0);
+});
+
 test("shared HTTPTransport keeps per-client workload", async () => {
   const gotWorkloads: string[] = [];
   const base = new HTTPTransport({
@@ -151,6 +209,7 @@ test("client retries with the original batch ID and event timestamp", async () =
     counters: [],
     values: [{ metric: "latency_ms", value: 1, sparse: false, success: false, labels: [], timestamp: 1730000000 }],
     uniques: [],
+    tops: [],
   };
   const internals = client as unknown as {
     nextSendAttempt: number;
@@ -183,6 +242,7 @@ test("client drops the oldest buffered batch when the outage buffer is full", as
     counters: [{ metric: "requests", value: 1, labels: [], timestamp: 1730000000 }],
     values: [],
     uniques: [],
+    tops: [],
   });
 
   internals.retryQueue.push({
@@ -295,6 +355,7 @@ test("client sends at most one replay batch per replay interval", async () => {
     counters: [{ metric: "requests", value: 1, labels: [], timestamp: 1730000000 }],
     values: [],
     uniques: [],
+    tops: [],
   });
   const bufferedAt = Date.now();
   internals.enqueueRetryAt(makePayload("batch-new"), 1, 0, new Error("offline"), bufferedAt);
@@ -486,6 +547,7 @@ function makeCounterPayload(batchID: string): Payload {
     counters: [{ metric: "requests", value: 1, labels: [], timestamp: 1730000000 }],
     values: [],
     uniques: [],
+    tops: [],
   };
 }
 

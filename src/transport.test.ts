@@ -12,6 +12,7 @@ const payload: Payload = {
   counters: [{ metric: "requests", value: 1, labels: [label("env", "test")], timestamp: 1730000000 }],
   values: [],
   uniques: [],
+  tops: [],
 };
 
 test("HTTPTransport sets auth, workload, batch headers and v5 body", async () => {

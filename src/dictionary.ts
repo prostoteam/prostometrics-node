@@ -59,10 +59,12 @@ export function encodeLinePayloadV5(payload: Payload | undefined, state: Diction
   }
 
   type EncodedEvent = {
-    metricType: "c" | "v" | "s" | "o" | "u";
+    metricType: "c" | "v" | "s" | "o" | "u" | "t";
     seriesID: number;
     value: number | string;
     timestamp: number;
+    // Top-list item, written after the timestamp because it may contain "|".
+    item?: string;
   };
 
   const events: EncodedEvent[] = [];
@@ -107,6 +109,16 @@ export function encodeLinePayloadV5(payload: Payload | undefined, state: Diction
       timestamp: unique.timestamp,
     });
   }
+  for (const top of payload!.tops ?? []) {
+    // Top series carry no labels in this protocol version.
+    events.push({
+      metricType: "t",
+      seriesID: getSeriesID(top.metric, []),
+      value: top.uniqueID,
+      timestamp: top.timestamp,
+      item: top.item,
+    });
+  }
 
   if (seriesChanged) {
     state.revision += 1;
@@ -124,7 +136,12 @@ export function encodeLinePayloadV5(payload: Payload | undefined, state: Diction
   }
 
   for (const event of events) {
-    lines.push(`${event.metricType}|${event.seriesID}|${formatEventValue(event.value)}|${event.timestamp}`);
+    let line = `${event.metricType}|${event.seriesID}|${formatEventValue(event.value)}|${event.timestamp}`;
+    if (event.metricType === "t") {
+      // The item goes last, verbatim: it may itself contain "|".
+      line += `|${event.item ?? ""}`;
+    }
+    lines.push(line);
   }
 
   return Buffer.from(`${lines.join("\n")}\n`, "utf8");
