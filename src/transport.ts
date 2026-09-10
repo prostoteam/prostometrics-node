@@ -1,9 +1,12 @@
+import { constants, gzipSync } from "node:zlib";
+
 import {
   ACCEPTED_HEADER_NAME,
   BATCH_ID_HEADER_NAME,
   DROPPED_HEADER_NAME,
   DEFAULT_STOP_RESPONSE_CODES,
   DEFAULT_STOP_STATUS_CODE,
+  COMPRESS_MIN_BYTES,
   DEFAULT_FLUSH_TIMEOUT_MS,
   REJECTED_HEADER_NAME,
   WORKLOAD_HEADER_NAME,
@@ -59,6 +62,33 @@ interface SendResult {
 const MAX_ERROR_BODY_BYTES = 4096;
 const DICTIONARY_RESYNC_WARNING_THRESHOLD = 3;
 const DICTIONARY_RESYNC_WARNING_WINDOW_MS = 5 * 60 * 1000;
+
+// A batch body is the same handful of shapes repeated line after line -- the
+// series ids, the second, the metric names, the paths -- and gives up about
+// three quarters of its size to gzip. The lowest level is deliberate: it keeps
+// most of that saving for a fraction of the processor time, and this runs in
+// the caller's application rather than ours.
+//
+// gzip is the choice because it is the only one every client can reach without
+// carrying a compressor: browsers offer it and nothing else for outgoing data,
+// and the standard library has it in Node, Go and Python alike.
+//
+// A body too small to be worth it, or one that failed to compress, is returned
+// as it came: the encoding is an optimisation and never a reason to lose a
+// batch.
+const compressBody = (body: Buffer): Buffer => {
+  if (body.byteLength < COMPRESS_MIN_BYTES) {
+    return body;
+  }
+  try {
+    const compressed = gzipSync(body, { level: constants.Z_BEST_SPEED });
+    // Already-compressed content can grow. Nothing a batch carries does, but
+    // sending more bytes than we were given never makes sense.
+    return compressed.byteLength < body.byteLength ? compressed : body;
+  } catch {
+    return body;
+  }
+};
 
 export class HTTPTransport implements Transport {
   endpoint: string;
@@ -192,8 +222,12 @@ export class HTTPTransport implements Transport {
     }
 
     try {
+      const encoded = compressBody(body);
       const headers = new Headers();
       headers.set("Content-Type", "text/plain; charset=utf-8");
+      if (encoded !== body) {
+        headers.set("Content-Encoding", "gzip");
+      }
       for (const [key, raw] of Object.entries(this.headers)) {
         const values = Array.isArray(raw) ? raw : [raw];
         for (const value of values) {
@@ -213,7 +247,7 @@ export class HTTPTransport implements Transport {
       const response = await this.fetchImpl(this.endpoint, {
         method: "POST",
         headers,
-        body,
+        body: encoded,
         signal: controller.signal,
       });
 

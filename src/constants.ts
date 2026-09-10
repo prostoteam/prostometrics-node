@@ -1,9 +1,39 @@
 export const DEFAULT_QUEUE_SIZE = 64 * 1024;
-export const DEFAULT_MAX_BATCH_SIZE = 512;
+
+// A batch closes on whichever of these it reaches first, and both are what the
+// ingest endpoint accepts rather than a guess. The event count matters for
+// unique and top metrics, whose repeats are dropped per batch: a bigger batch
+// collapses more of them and so sends less.
+export const DEFAULT_MAX_BATCH_SIZE = 4096;
+
+// Well under the 265 KiB the endpoint takes, because the series definitions and
+// the header ride along with the events and are not counted here.
+export const DEFAULT_MAX_BATCH_BYTES = 160 * 1024;
+
+// How many distinct series one batch may carry. The endpoint refuses a batch
+// defining more than this many, and a batch defines every series in it that the
+// dictionary has not seen -- which on a first flush is all of them. Bounding
+// events alone is not enough: 4096 events can be 4096 series.
+export const DEFAULT_MAX_BATCH_SERIES = 1024;
+
+// Three separate ceilings that are not that one, and must not be conflated with
+// it: how many counter series one batch aggregates into single events, how
+// large the dictionary grows before it is thrown away and every definition
+// re-sent, and how many distinct cumulative totals one process may track for
+// the whole of its life.
 export const DEFAULT_MAX_SERIES_PER_BATCH = 2048;
 export const DEFAULT_MAX_DICTIONARY_SERIES = DEFAULT_MAX_SERIES_PER_BATCH;
 export const DEFAULT_MAX_TOTAL_SERIES = DEFAULT_MAX_SERIES_PER_BATCH;
-export const DEFAULT_FLUSH_INTERVAL_MS = 500;
+
+// Nothing reads a metric faster than this: the finest chart bucket is ten
+// seconds and the dashboard refetches at most every few. Flushing oftener than
+// anything can be seen only costs requests, and costs the batching that makes
+// unique and top metrics affordable.
+export const DEFAULT_FLUSH_INTERVAL_MS = 2000;
+
+// Below this a compressed body saves less than the request's own headers cost,
+// and spends the caller's processor to do it.
+export const COMPRESS_MIN_BYTES = 1024;
 export const DEFAULT_FLUSH_TIMEOUT_MS = 5000;
 export const DEFAULT_RETRY_QUEUE_SIZE = 4096;
 export const DEFAULT_RETRY_FLUSH_MAX_SENDS = 1;

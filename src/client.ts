@@ -4,6 +4,8 @@ import {
   DEFAULT_CLIENT_BACKOFF_JITTER_WINDOW_MS,
   DEFAULT_CLIENT_BACKOFF_MAX_DELAY_MS,
   DEFAULT_FLUSH_INTERVAL_MS,
+  DEFAULT_MAX_BATCH_BYTES,
+  DEFAULT_MAX_BATCH_SERIES,
   DEFAULT_MAX_BATCH_SIZE,
   DEFAULT_MAX_TOTAL_SERIES,
   DEFAULT_OUTAGE_BUFFER_MAX_AGE_MS,
@@ -28,7 +30,7 @@ import { HTTPTransportError, StopIngestError, isStopIngestError } from "./errors
 import { BatchBuilder } from "./batch-builder.js";
 import { isValidSample, normalizeLabels, normalizeMetric } from "./labels.js";
 import type { Event, Payload } from "./payload.js";
-import { payloadIsEmpty } from "./payload.js";
+import { definitionWireSize, eventWireSize, payloadIsEmpty } from "./payload.js";
 import { RingBuffer } from "./ring-buffer.js";
 import { seriesKey } from "./series.js";
 import { isValidTopItem } from "./top-item.js";
@@ -392,7 +394,29 @@ export class Client {
 
   private async flushOneBatch(ignoreRetryBackoff: boolean, signal?: AbortSignal): Promise<void> {
     const events: Event[] = [];
-    while (events.length < DEFAULT_MAX_BATCH_SIZE) {
+    // A batch is full on whichever of three ceilings it reaches first, because
+    // the endpoint refuses a batch whole on any of them. Events alone bound
+    // neither the bytes -- a few thousand long top-list items are megabytes --
+    // nor the series definitions, which a first flush carries one of per series
+    // it touches.
+    let batchBytes = 0;
+    const batchSeries = new Set<string>();
+    const take = (event: Event): void => {
+      events.push(event);
+      batchBytes += eventWireSize(event);
+      // A series pays for its definition the first time the batch mentions it,
+      // because the definition travels in the same body.
+      const key = seriesKey(event.metric, event.labels);
+      if (!batchSeries.has(key)) {
+        batchSeries.add(key);
+        batchBytes += definitionWireSize(event.metric, event.labels);
+      }
+    };
+    while (
+      events.length < DEFAULT_MAX_BATCH_SIZE &&
+      batchBytes < DEFAULT_MAX_BATCH_BYTES &&
+      batchSeries.size < DEFAULT_MAX_BATCH_SERIES
+    ) {
       const event = this.queue.shift();
       if (!event) {
         break;
@@ -402,10 +426,10 @@ export class Client {
         if (!converted) {
           continue;
         }
-        events.push(converted);
+        take(converted);
         continue;
       }
-      events.push(event);
+      take(event);
     }
     if (events.length === 0) {
       return;
